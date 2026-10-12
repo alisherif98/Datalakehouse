@@ -1,0 +1,14 @@
+-- Run with: docker exec -it flink-jobmanager ./bin/sql-client.sh -i /opt/flink/sql/01_bootstrap.sql
+CREATE CATALOG iceberg WITH (
+  'type'='iceberg',
+  'catalog-impl'='org.apache.iceberg.nessie.NessieCatalog',
+  'uri'='http://nessie:19120/api/v2',
+  'ref'='main',
+  'authentication.type'='NONE',
+  'warehouse'='s3://warehouse/',
+  'io-impl'='org.apache.iceberg.aws.s3.S3FileIO',
+  's3.endpoint'='http://minio:9000',
+  's3.path-style-access'='true'
+);
+USE CATALOG iceberg;
+CREATE DATABASE IF NOT EXISTS lab;
