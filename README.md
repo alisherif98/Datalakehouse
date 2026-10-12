@@ -98,7 +98,7 @@ The three layers have separate jobs:
 ## 4. 🚀 First startup
 
 ```bash
-cd ~/iceberg-lab                      # or ~/apache_iceberg - wherever this folder lives
+cd ~/iceberg-lab                      # Download the repo and add the all components in folder and name it with "iceberg-lab"
 docker compose config --quiet && echo "YAML OK"
 
 # optional: confirm every image tag exists before pulling
