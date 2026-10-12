@@ -1,0 +1,259 @@
+# =====================================================================
+# Apache Iceberg Practice Lakehouse - core profile
+# storage (MinIO) + catalog (Nessie/PostgreSQL) + Spark + Trino + Flink + Dremio
+#
+# CHANGELOG
+# 2026-09-11 MinIO removed minio/minio + minio/mc from Docker Hub.
+# 2026-09-24 quay.io began refusing anonymous pulls of MinIO images.
+#   FIX  MinIO server -> alpine/minio (community rebuild, Docker Hub)
+#        Bucket setup -> amazon/aws-cli (no MinIO client image needed)
+# 2026-10-03 alpine/minio runs as non-root; old root-owned minio_data volume
+#        -> MinIO runs as root (user "0:0") + real healthcheck (wget)
+#        -> mc waits for service_healthy and fails fast with the real error
+# 2026-10-10 Fedora/SELinux: bind mounts labelled (:z shared, :Z private)
+#        -> Trino catalog mounted ":ro,Z" (fixes "Permission denied" on
+#           /etc/trino/catalog -> only the "system" catalog visible)
+#
+# Start everything     : docker compose up -d --build
+# Start a subset       : docker compose up -d minio mc nessie spark-iceberg
+# Tear down, keep data : docker compose down
+# Tear down + WIPE data: docker compose down -v
+# =====================================================================
+name: iceberg-lab
+
+networks:
+  iceberg_net:
+    driver: bridge
+
+volumes:
+  minio_data:
+  nessie_pg_data:
+  dremio_data:
+  spark_warehouse:
+
+services:
+  # ---------------------------------------------------------------
+  # 1. STORAGE - MinIO (S3-compatible). Console http://127.0.0.1:9001
+  # ---------------------------------------------------------------
+  minio:
+    image: alpine/minio:RELEASE.2025-10-15T17-29-55Z
+    container_name: minio
+    hostname: minio
+    user: "0:0"                     # volume may be root-owned from older image
+    restart: unless-stopped
+    networks:
+      iceberg_net:
+        aliases:
+          - warehouse.minio          # virtual-hosted-style safety net
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-admin}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-password}
+      MINIO_DOMAIN: minio
+      MINIO_REGION: ${AWS_REGION:-us-east-1}
+    ports:
+      - "127.0.0.1:9000:9000"        # S3 API (localhost only - known CVE in this build)
+      - "127.0.0.1:9001:9001"        # web console
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # ---------------------------------------------------------------
+  # 1b. One-shot bucket bootstrap (name "mc" kept for history)
+  # ---------------------------------------------------------------
+  mc:
+    image: amazon/aws-cli:latest
+    container_name: mc
+    networks: [iceberg_net]
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-password}
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_MAX_ATTEMPTS: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        EP=http://minio:9000
+        OPTS="--endpoint-url $$EP --cli-connect-timeout 3 --cli-read-timeout 5"
+        n=0
+        until aws $$OPTS s3 ls >/tmp/err 2>&1; do
+          n=$$((n+1))
+          if [ $$n -ge 30 ]; then echo 'MinIO not reachable after ~90s. Last error:'; cat /tmp/err; exit 1; fi
+          echo '...waiting for minio...'; sleep 2
+        done
+        for b in warehouse landing; do
+          if aws $$OPTS s3api head-bucket --bucket $$b >/dev/null 2>&1; then
+            echo "bucket $$b already exists"
+          else
+            aws $$OPTS s3 mb s3://$$b && echo "bucket $$b created"
+          fi
+        done
+        echo 'Buckets ready: warehouse, landing'
+
+  # ---------------------------------------------------------------
+  # 2. CATALOG DB - PostgreSQL (Nessie commit history). Internal only.
+  # ---------------------------------------------------------------
+  nessie-db:
+    image: postgres:16-alpine
+    container_name: nessie-db
+    networks: [iceberg_net]
+    environment:
+      POSTGRES_USER: nessie
+      POSTGRES_PASSWORD: nessie
+      POSTGRES_DB: nessie
+    volumes:
+      - nessie_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nessie"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------
+  # 3. CATALOG - Project Nessie. UI + APIs http://localhost:19120
+  #    Native API  : /api/v2          (Spark, Flink, Dremio)
+  #    Iceberg REST: /iceberg/main    (Trino)
+  # ---------------------------------------------------------------
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.99.0
+    container_name: nessie
+    networks: [iceberg_net]
+    depends_on:
+      nessie-db:
+        condition: service_healthy
+    ports:
+      - "19120:19120"
+    environment:
+      nessie.version.store.type: JDBC
+      quarkus.datasource.jdbc.url: jdbc:postgresql://nessie-db:5432/nessie
+      quarkus.datasource.username: nessie
+      quarkus.datasource.password: nessie
+      nessie.catalog.default-warehouse: warehouse
+      nessie.catalog.warehouses.warehouse.location: s3://warehouse/
+      nessie.catalog.service.s3.default-options.endpoint: http://minio:9000/
+      nessie.catalog.service.s3.default-options.path-style-access: "true"
+      nessie.catalog.service.s3.default-options.region: ${AWS_REGION:-us-east-1}
+      nessie.catalog.service.s3.default-options.access-key: urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
+      nessie.catalog.secrets.access-key.name: ${AWS_ACCESS_KEY_ID:-admin}
+      nessie.catalog.secrets.access-key.secret: ${AWS_SECRET_ACCESS_KEY:-password}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  # ---------------------------------------------------------------
+  # 4. ENGINE - Spark 3.5.5 + Iceberg 1.8.1 + Jupyter (http://localhost:8888)
+  # ---------------------------------------------------------------
+  spark-iceberg:
+    image: tabulario/spark-iceberg:3.5.5_1.8.1
+    container_name: spark-iceberg
+    networks: [iceberg_net]
+    depends_on:
+      nessie:
+        condition: service_healthy
+      mc:
+        condition: service_completed_successfully
+    ports:
+      - "8888:8888"     # Jupyter
+      - "8080:8080"     # Spark master UI
+      - "4040:4040"     # running application UI
+      - "10000:10000"   # Thrift JDBC/ODBC (if started)
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-password}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:z
+      - ./notebooks:/home/iceberg/notebooks/lab:z
+      - ./scripts:/home/iceberg/scripts:z
+      - spark_warehouse:/home/iceberg/warehouse
+
+  # ---------------------------------------------------------------
+  # 5. ENGINE - Trino 449 (host 8082 -> container 8080)
+  # ---------------------------------------------------------------
+  trino:
+    image: trinodb/trino:449
+    container_name: trino
+    networks: [iceberg_net]
+    depends_on:
+      nessie:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro,Z
+
+  # ---------------------------------------------------------------
+  # 6. ENGINE - Flink 1.18.1 (built: + Iceberg 1.5.2 jars). UI :8081
+  # ---------------------------------------------------------------
+  flink-jobmanager:
+    build: ./flink
+    image: iceberg-lab/flink:1.18.1
+    container_name: flink-jobmanager
+    networks: [iceberg_net]
+    depends_on:
+      nessie:
+        condition: service_healthy
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-password}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: 0.0.0.0
+        taskmanager.numberOfTaskSlots: 4
+        execution.checkpointing.interval: 30s
+        state.backend: hashmap
+    volumes:
+      - ./flink/sql:/opt/flink/sql:z
+
+  flink-taskmanager:
+    image: iceberg-lab/flink:1.18.1
+    container_name: flink-taskmanager
+    networks: [iceberg_net]
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+    command: taskmanager
+    scale: 1
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-password}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        execution.checkpointing.interval: 30s
+        state.backend: hashmap
+
+  # ---------------------------------------------------------------
+  # 7. ENGINE + SEMANTIC LAYER - Dremio OSS. UI http://localhost:9047
+  #    Configured in the UI (Nessie source) - see README section 7.
+  # ---------------------------------------------------------------
+  dremio:
+    image: dremio/dremio-oss:latest
+    container_name: dremio
+    networks: [iceberg_net]
+    ports:
+      - "9047:9047"     # web UI / REST
+      - "31010:31010"   # legacy ODBC/JDBC
+      - "32010:32010"   # Arrow Flight SQL (Power BI)
+    environment:
+      DREMIO_JAVA_SERVER_EXTRA_OPTS: -Dpaths.dist=file:///opt/dremio/data/dist
+    volumes:
+      - dremio_data:/opt/dremio/data
+    mem_limit: 6g
